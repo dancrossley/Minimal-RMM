@@ -1,5 +1,6 @@
 # Enhanced RMM PowerShell Client with Dynamic Configuration
 # Set RMM_BASE_URL in the environment to override (no trailing slash), or edit $u below.
+$env:RMM_BASE_URL = "http://192.168.97.133:8080"
 
 if ($env:RMM_BASE_URL -and $env:RMM_BASE_URL.Trim().Length -gt 0) {
     $u = $env:RMM_BASE_URL.Trim().TrimEnd('/')
