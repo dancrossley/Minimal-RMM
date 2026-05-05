@@ -626,105 +626,103 @@ static char *exec_cmd(const char *inner_command) {
         GetEnvironmentVariableA("USERPROFILE", g_cwd, MAX_PATH);
     }
 
-    /* Build combined command: cd /d "<cwd>" & <cmd> & echo RMM_CWD_SIG:%CD% */
     char norm_cmd[4096];
     normalize_for_cmd(inner_command, norm_cmd, sizeof(norm_cmd));
 
-    /* Temp files for stdout / stderr */
+    /*
+     * Write to a temp .bat file to avoid nested-quoting issues that arise
+     * when the CWD path contains spaces and is embedded inside cmd /c "...".
+     * Batch file quoting is straightforward: cd /d "path" is always safe.
+     * %CD% inside a plain batch statement expands correctly (no %% needed).
+     */
     char tmp_path[MAX_PATH];
     GetTempPathA(MAX_PATH, tmp_path);
-    char stdout_file[MAX_PATH], stderr_file[MAX_PATH];
-    snprintf(stdout_file, MAX_PATH, "%srmm_stdout_%lu.tmp", tmp_path, GetCurrentProcessId());
-    snprintf(stderr_file, MAX_PATH, "%srmm_stderr_%lu.tmp", tmp_path, GetCurrentProcessId());
+    char bat_file[MAX_PATH];
+    snprintf(bat_file, MAX_PATH, "%srmm_%lu.bat", tmp_path, GetCurrentProcessId());
 
-    /* Quote the CWD */
-    char cwd_q[MAX_PATH + 4];
-    snprintf(cwd_q, sizeof(cwd_q), "\"%s\"", g_cwd);
+    {
+        HANDLE hbat = CreateFileA(bat_file, GENERIC_WRITE, 0, NULL,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hbat == INVALID_HANDLE_VALUE)
+            return _strdup("(failed to create temp batch file)");
+        char bat[8192];
+        DWORD wr;
+        int n = snprintf(bat, sizeof(bat),
+                         "@echo off\r\ncd /d \"%s\"\r\n%s\r\necho RMM_CWD_SIG:%%CD%%\r\n",
+                         g_cwd, norm_cmd);
+        WriteFile(hbat, bat, (DWORD)n, &wr, NULL);
+        CloseHandle(hbat);
+    }
 
-    /* Full combined command line */
-    char combined[8192];
-    snprintf(combined, sizeof(combined),
-             "cd /d %s & %s & echo RMM_CWD_SIG:%%CD%%",
-             cwd_q, norm_cmd);
+    /* Capture stdout+stderr through an anonymous pipe (no shell redirection needed) */
+    HANDLE hread, hwrite;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    if (!CreatePipe(&hread, &hwrite, &sa, 0)) {
+        DeleteFileA(bat_file);
+        return _strdup("(pipe creation failed)");
+    }
+    SetHandleInformation(hread, HANDLE_FLAG_INHERIT, 0);
 
-    /* cmd /d /c "..." >stdout 2>stderr */
-    char cmd_line[10240];
-    snprintf(cmd_line, sizeof(cmd_line),
-             "cmd.exe /d /c \"%s\" > \"%s\" 2> \"%s\"",
-             combined, stdout_file, stderr_file);
+    char cmd_line[MAX_PATH + 32];
+    snprintf(cmd_line, sizeof(cmd_line), "cmd.exe /d /c \"%s\"", bat_file);
 
     STARTUPINFOA si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {0};
-    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.dwFlags    = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
+    si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = hwrite;
+    si.hStdError  = hwrite;
 
-    BOOL created = CreateProcessA(NULL, cmd_line, NULL, NULL, FALSE,
+    PROCESS_INFORMATION pi = {0};
+    BOOL created = CreateProcessA(NULL, cmd_line, NULL, NULL, TRUE,
                                   CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-    if (created) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD exit_code = 0;
-        GetExitCodeProcess(pi.hProcess, &exit_code);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    CloseHandle(hwrite);  /* close our copy so ReadFile sees EOF when process exits */
+
+    if (!created) {
+        CloseHandle(hread);
+        DeleteFileA(bat_file);
+        return _strdup("(CreateProcess failed)");
     }
 
-    /* Read stdout + stderr */
+    /* Read all output */
     size_t alloc = 8192, used = 0;
     char *output = (char*)malloc(alloc);
-    if (!output) output = _strdup("(out of memory)");
+    if (!output) { output = _strdup("(out of memory)"); goto cleanup; }
 
-    HANDLE hf = CreateFileA(stdout_file, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
-                             NULL, OPEN_EXISTING, 0, NULL);
-    if (hf != INVALID_HANDLE_VALUE) {
+    {
         DWORD rd;
-        char tmp[4096];
-        while (ReadFile(hf, tmp, sizeof(tmp), &rd, NULL) && rd > 0) {
+        char buf[4096];
+        while (ReadFile(hread, buf, sizeof(buf), &rd, NULL) && rd > 0) {
             if (used + rd + 1 >= alloc) {
                 alloc += rd + 4096;
                 char *t = (char*)realloc(output, alloc);
                 if (t) output = t;
             }
-            memcpy(output + used, tmp, rd);
+            memcpy(output + used, buf, rd);
             used += rd;
         }
-        CloseHandle(hf);
+        output[used] = '\0';
     }
 
-    HANDLE hfe = CreateFileA(stderr_file, GENERIC_READ, FILE_SHARE_READ|FILE_SHARE_WRITE,
-                              NULL, OPEN_EXISTING, 0, NULL);
-    if (hfe != INVALID_HANDLE_VALUE) {
-        DWORD rd;
-        char tmp[4096];
-        if (used > 0) { /* separator */
-            if (used + 2 < alloc) { output[used++] = '\n'; }
-        }
-        while (ReadFile(hfe, tmp, sizeof(tmp), &rd, NULL) && rd > 0) {
-            if (used + rd + 1 >= alloc) {
-                alloc += rd + 4096;
-                char *t = (char*)realloc(output, alloc);
-                if (t) output = t;
-            }
-            memcpy(output + used, tmp, rd);
-            used += rd;
-        }
-        CloseHandle(hfe);
-    }
-    output[used] = '\0';
+cleanup:
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hread);
+    DeleteFileA(bat_file);
 
-    /* Extract RMM_CWD_SIG: and update g_cwd, strip the marker line from output */
+    /* Strip RMM_CWD_SIG: lines and update g_cwd */
     char clean[65536];
     int ci = 0;
     char *line = output;
     while (line && *line) {
         char *nl = strpbrk(line, "\r\n");
         int line_len = nl ? (int)(nl - line) : (int)strlen(line);
-        /* Check for CWD marker */
         if (line_len > 12 && strncmp(line, "RMM_CWD_SIG:", 12) == 0) {
             int cwd_len = line_len - 12;
             if (cwd_len >= MAX_PATH) cwd_len = MAX_PATH - 1;
             strncpy(g_cwd, line + 12, cwd_len);
             g_cwd[cwd_len] = '\0';
-            /* trim trailing whitespace */
             int cl = (int)strlen(g_cwd);
             while (cl > 0 && (g_cwd[cl-1] == ' ' || g_cwd[cl-1] == '\r' || g_cwd[cl-1] == '\n'))
                 g_cwd[--cl] = '\0';
@@ -732,17 +730,14 @@ static char *exec_cmd(const char *inner_command) {
             if (ci + line_len + 2 < (int)sizeof(clean)) {
                 memcpy(clean + ci, line, line_len);
                 ci += line_len;
-                if (nl) { clean[ci++] = '\n'; }
+                if (nl) clean[ci++] = '\n';
             }
         }
         line = nl ? nl + (nl[0] == '\r' && nl[1] == '\n' ? 2 : 1) : NULL;
     }
-    /* Remove trailing newlines */
     while (ci > 0 && (clean[ci-1] == '\n' || clean[ci-1] == '\r')) ci--;
     clean[ci] = '\0';
 
-    DeleteFileA(stdout_file);
-    DeleteFileA(stderr_file);
     free(output);
 
     char *result = _strdup(clean);
