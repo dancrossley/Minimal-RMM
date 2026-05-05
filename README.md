@@ -144,6 +144,49 @@ The prompt shows **date and time** (local) plus `RMM` or `RMM [<session id prefi
 
 ---
 
+## C Client (`client_rmm.c`)
+
+`client_rmm.c` is a full C rewrite of `client_rmm.ps1` for Windows targets where PowerShell is unavailable or disabled.  It is **protocol-compatible** with the Python server and implements every feature of the PowerShell client.
+
+### Build (Visual Studio Developer Command Prompt)
+
+```bat
+cl /nologo /W3 /O2 client_rmm.c ^
+   /link winhttp.lib ole32.lib gdi32.lib advapi32.lib shell32.lib user32.lib
+```
+
+No external libraries are required.  All HTTP is handled via the built-in **WinHTTP** API; PNG screenshots use **GDI+**, loaded at runtime from `gdiplus.dll` (present on every Windows Vista+ system).
+
+### Run
+
+```bat
+set RMM_BASE_URL=https://your-tunnel-or-host.example.com
+client_rmm.exe
+```
+
+Or edit `DEFAULT_BASE_URL` in the source before compiling.
+
+### Features
+
+| Feature | Notes |
+|---------|-------|
+| Beacon loop | Jitter + micro-jitter, exponential back-off on failure |
+| `__CONFIG__` | Dynamic sleep / jitter update with acknowledgment |
+| `__EXIT__` / `__STOP__` | Clean shutdown / stop persistent command |
+| CMD execution | CWD tracked across beacon cycles via `RMM_CWD_SIG:` |
+| `PS:` / `powershell:` prefix | Runs via `powershell.exe -EncodedCommand` (UTF-16LE base64) |
+| `pwsh:` prefix | Runs via `pwsh.exe` if found, else falls back to `powershell.exe` |
+| `cmd:` prefix | Explicit cmd.exe |
+| `__DOWNLOAD__` | Exfiltrates file as base64 JSON (12 MB cap) |
+| `__UPLOAD__` | Writes base64-decoded file to target path |
+| `__SCREENSHOT__` | GDI BitBlt → GDI+ PNG → base64 |
+| `__KEYLOG__ start\|stop\|dump` | `GetAsyncKeyState` thread, temp-file log |
+| `__INSTALL_PERSIST__` | Copies `.exe` to user Startup folder + registry run key |
+| `__REMOVE_PERSIST__` | Reverses the above |
+| User-Agent rotation | Five common browser UA strings |
+
+---
+
 ## Client (`client_rmm.ps1`) behavior
 
 - **URL:** set `RMM_BASE_URL` to the server base URL (no trailing slash), or edit `$u` in the script. If the value still contains the placeholder `REPLACE-WITH-YOUR-CLOUDFLARED-URL`, the script exits.
@@ -204,7 +247,8 @@ powershell -ExecutionPolicy Bypass -File .\client_rmm.ps1
 | Path | Role |
 |------|------|
 | `server_rmm.py` | HTTP server + interactive console |
-| `client_rmm.ps1` | Windows beacon client |
+| `client_rmm.ps1` | Windows beacon client (PowerShell) |
+| `client_rmm.c` | Windows beacon client (C, Visual Studio) |
 | `requirements.txt` | Optional: `prompt_toolkit` |
 | `RMM_logs/` | Created at runtime: `sessions.json`, `downloads/`, `screenshots/`, `keylogs/` |
 | `~/.RMM_history` | CLI command history (readline / prompt_toolkit) |
